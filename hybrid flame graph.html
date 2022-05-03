@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas' style='width: 100%; height: 528px'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(33);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xa6e1a6, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+f(0,0,10005,3,'all')
+f(1,0,1,3,'[unknown_Java]')
+f(2,0,1,3,'SafepointBlob')
+f(1,1,9915,1,'java/lang/Thread.run')
+f(2,1,84,1,'akka/actor/LightArrayRevolverScheduler$$anon$3.run')
+f(3,1,84,1,'akka/actor/LightArrayRevolverScheduler$$anon$3.nextTick')
+f(4,2,83,1,'akka/actor/LightArrayRevolverScheduler.waitNanos')
+f(5,2,83,1,'java/lang/Thread.sleep')
+f(6,2,83,3,'JVM_Sleep')
+f(7,2,83,4,'os::sleep(Thread*, long, bool)')
+f(8,2,83,4,'os::PlatformEvent::park(long)')
+f(9,3,1,3,'__gettimeofday')
+f(9,4,81,3,'__psynch_cvwait')
+f(2,85,56,1,'java/util/concurrent/ThreadPoolExecutor$Worker.run')
+f(3,85,56,1,'java/util/concurrent/ThreadPoolExecutor.runWorker')
+f(4,89,4,1,'java/util/concurrent/FutureTask.run')
+f(5,89,4,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(6,89,4,1,'org/apache/flink/connector/base/source/reader/fetcher/SplitFetcher.run')
+f(7,89,4,1,'org/apache/flink/connector/base/source/reader/fetcher/SplitFetcher.runOnce')
+f(8,89,4,1,'org/apache/flink/connector/base/source/reader/fetcher/FetchTask.run')
+f(9,89,4,1,'org/apache/flink/connector/kafka/source/reader/KafkaPartitionSplitReader.fetch')
+f(10,89,4,1,'org/apache/kafka/clients/consumer/KafkaConsumer.poll')
+f(11,89,4,1,'org/apache/kafka/clients/consumer/KafkaConsumer.poll')
+f(12,89,4,1,'org/apache/kafka/clients/consumer/KafkaConsumer.pollForFetches')
+f(13,89,4,1,'org/apache/kafka/clients/consumer/internals/ConsumerNetworkClient.poll')
+f(14,89,4,1,'org/apache/kafka/clients/consumer/internals/ConsumerNetworkClient.poll')
+f(15,89,4,1,'org/apache/kafka/clients/NetworkClient.poll')
+f(16,89,1,1,'org/apache/kafka/clients/NetworkClient.handleCompletedReceives')
+f(17,89,1,1,'org/apache/kafka/clients/NetworkClient.parseStructMaybeUpdateThrottleTimeMetrics')
+f(18,89,1,1,'org/apache/kafka/clients/NetworkClient.correlate')
+f(19,89,1,1,'org/apache/kafka/common/requests/RequestHeader.correlationId')
+f(16,90,3,1,'org/apache/kafka/common/network/Selector.poll')
+f(17,90,3,1,'org/apache/kafka/common/network/Selector.select')
+f(18,90,3,1,'sun/nio/ch/SelectorImpl.select')
+f(19,90,3,1,'sun/nio/ch/SelectorImpl.lockAndDoSelect')
+f(20,90,3,1,'sun/nio/ch/KQueueSelectorImpl.doSelect')
+f(21,90,2,1,'sun/nio/ch/KQueue.poll')
+f(22,90,2,3,'kevent')
+f(21,92,1,1,'sun/nio/ch/KQueueSelectorImpl.processEvents')
+f(22,92,1,1,'sun/nio/ch/SelectorImpl.processReadyEvents')
+f(4,93,5,1,'java/util/concurrent/ScheduledThreadPoolExecutor$ScheduledFutureTask.run')
+f(5,93,4,1,'java/util/concurrent/FutureTask.runAndReset')
+f(6,93,3,1,'java/util/concurrent/Executors$RunnableAdapter.call')
+f(7,93,3,1,'org/apache/flink/streaming/runtime/tasks/SystemProcessingTimeService$ScheduledTask.run')
+f(8,93,3,1,'org/apache/flink/streaming/runtime/tasks/ProcessingTimeServiceImpl$$Lambda$1441/1056205960.onProcessingTime')
+f(9,93,3,1,'org/apache/flink/streaming/runtime/tasks/ProcessingTimeServiceImpl.lambda$addQuiesceProcessingToCallback$0')
+f(10,93,3,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1431/108887852.onProcessingTime')
+f(11,93,3,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.lambda$deferCallbackToMailbox$23')
+f(12,94,2,1,'java/lang/invoke/LambdaForm$MH/1238466927.linkToTargetMethod')
+f(13,94,2,1,'java/lang/invoke/LambdaForm$DMH/1307446282.invokeStatic')
+f(14,94,2,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1544/58944163.get$Lambda')
+f(15,94,2,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1544/58944163.<init>')
+f(16,94,2,4,'Runtime1::new_instance(JavaThread*, Klass*)')
+f(17,94,1,4,'InstanceKlass::allocate_instance(Thread*)')
+f(18,94,1,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(19,94,1,4,'MemAllocator::allocate() const')
+f(20,94,1,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(21,94,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(22,94,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(23,94,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(24,94,1,4,'Monitor::lock(Thread*)')
+f(25,94,1,4,'Monitor::ILock(Thread*)')
+f(26,94,1,4,'os::PlatformEvent::park()')
+f(27,94,1,3,'__psynch_cvwait')
+f(17,95,1,4,'oopDesc* G1BarrierSet::AccessBarrier<1097844ull, G1BarrierSet>::oop_load_not_in_heap<oopDesc*>(oopDesc**)')
+f(18,95,1,4,'oopDesc* RawAccessBarrier<1097844ull>::oop_load<oopDesc*>(void*)')
+f(19,95,1,4,'EnableIf<HasDecorator<1097844ull, MO_UNORDERED>::value, oopDesc*>::type RawAccessBarrier<1097844ull>::load_internal<1097844ull, oopDesc*>(void*)')
+f(6,96,1,1,'java/util/concurrent/FutureTask.handlePossibleCancellationInterrupt')
+f(5,97,1,1,'java/util/concurrent/ScheduledThreadPoolExecutor.reExecutePeriodic')
+f(6,97,1,1,'java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue.add')
+f(7,97,1,1,'java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue.add')
+f(8,97,1,1,'java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue.offer')
+f(9,97,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.signal')
+f(4,98,43,1,'java/util/concurrent/ThreadPoolExecutor.getTask')
+f(5,100,41,1,'java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue.take')
+f(6,100,41,1,'java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue.take')
+f(7,100,1,1,'java/util/concurrent/ScheduledThreadPoolExecutor$ScheduledFutureTask.getDelay')
+f(8,100,1,1,'java/util/concurrent/TimeUnit.convert')
+f(7,101,40,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.awaitNanos')
+f(8,102,2,1,'java/lang/Thread.interrupted')
+f(9,102,2,1,'java/lang/Thread.isInterrupted')
+f(10,103,1,4,'OrderAccess::fence()')
+f(8,104,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject.checkInterruptWhileWaiting')
+f(9,104,1,1,'java/lang/Thread.interrupted')
+f(10,104,1,1,'java/lang/Thread.isInterrupted')
+f(11,104,1,4,'ThreadInVMfromNative::~ThreadInVMfromNative()')
+f(8,105,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.transferAfterCancelledWait')
+f(9,105,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.enq')
+f(8,106,35,1,'java/util/concurrent/locks/LockSupport.parkNanos')
+f(9,106,35,1,'jdk/internal/misc/Unsafe.park')
+f(10,106,35,3,'Unsafe_Park(JNIEnv_*, _jobject*, unsigned char, long)')
+f(11,107,1,4,'JavaThread::thread_from_jni_environment(JNIEnv_*)')
+f(12,107,1,4,'JavaThread::is_terminated() const')
+f(13,107,1,4,'int OrderAccess::load_acquire<int>(int const volatile*)')
+f(14,107,1,4,'Atomic::LoadImpl<int, OrderAccess::PlatformOrderedLoad<4ul, (ScopedFenceType)0>, void>::operator()(int const volatile*) const')
+f(15,107,1,4,'ScopedFenceGeneral<(ScopedFenceType)0>::postfix()')
+f(11,108,33,4,'Parker::park(bool, long)')
+f(12,108,2,3,'__gettimeofday')
+f(12,110,31,3,'__psynch_cvwait')
+f(2,141,9775,1,'org/apache/flink/runtime/taskmanager/Task.run')
+f(3,141,9775,1,'org/apache/flink/runtime/taskmanager/Task.doRun')
+f(4,141,9775,1,'org/apache/flink/runtime/taskmanager/Task.restoreAndInvoke')
+f(5,141,9775,1,'org/apache/flink/runtime/taskmanager/Task.runWithSystemExitMonitoring')
+f(6,141,9775,1,'org/apache/flink/runtime/taskmanager/Task$$Lambda$1472/613583471.run')
+f(7,141,9775,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.invoke')
+f(8,141,9775,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.runMailboxLoop')
+f(9,141,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1130/1756930956.runDefaultAction')
+f(10,141,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.processInput')
+f(11,141,1,1,'org/apache/flink/streaming/runtime/io/StreamOneInputProcessor.processInput')
+f(12,141,1,1,'org/apache/flink/streaming/runtime/io/StreamTaskSourceInput.emitNext')
+f(13,141,1,1,'org/apache/flink/streaming/api/operators/SourceOperator.emitNext')
+f(14,141,1,1,'org/apache/flink/connector/base/source/hybrid/HybridSourceReader.pollNext')
+f(15,141,1,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.pollNext')
+f(16,141,1,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.getNextFetch')
+f(17,141,1,1,'org/apache/flink/connector/base/source/reader/synchronization/FutureCompletingBlockingQueue.poll')
+f(18,141,1,1,'java/util/concurrent/locks/ReentrantLock.unlock')
+f(19,141,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.release')
+f(9,142,9774,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.runMailboxLoop')
+f(10,147,9749,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1130/1756930956.runDefaultAction')
+f(11,147,9749,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.processInput')
+f(12,2282,11,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(13,2282,11,4,'InstanceKlass::allocate_instance(Thread*)')
+f(14,2283,10,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(15,2283,10,4,'MemAllocator::allocate() const')
+f(16,2283,1,4,'MemAllocator::Allocation::notify_allocation()')
+f(17,2283,1,4,'MemAllocator::Allocation::notify_allocation_low_memory_detector()')
+f(16,2284,9,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(17,2284,9,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(18,2286,1,4,'G1Allocator::unsafe_max_tlab_alloc()')
+f(19,2286,1,4,'G1ContiguousSpace::free() const')
+f(18,2287,5,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(19,2287,1,4,'G1CardTable::g1_mark_as_young(MemRegion const&)')
+f(19,2288,4,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(20,2289,1,4,'G1AllocRegion::new_alloc_region_and_allocate(unsigned long, bool)')
+f(21,2289,1,4,'G1CollectedHeap::new_mutator_alloc_region(unsigned long, bool)')
+f(22,2289,1,4,'G1CollectedHeap::new_region(unsigned long, bool, bool)')
+f(20,2290,2,4,'G1CollectedHeap::do_collection_pause(unsigned long, unsigned int, bool*, GCCause::Cause)')
+f(21,2290,2,4,'VMThread::execute(VM_Operation*)')
+f(22,2290,2,4,'Monitor::wait(bool, long, bool)')
+f(23,2290,2,4,'Monitor::IWait(Thread*, long)')
+f(24,2290,2,4,'os::PlatformEvent::park()')
+f(25,2290,2,3,'__psynch_cvwait')
+f(18,2292,1,4,'ThreadLocalAllocBuffer::fill(HeapWord*, HeapWord*, unsigned long)')
+f(12,2293,9,3,'SafepointBlob')
+f(12,2302,4,4,'Set::asCoSet() const (.cold.1)')
+f(12,2306,3,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(13,2306,3,4,'SafepointSynchronize::block(JavaThread*)')
+f(14,2306,3,4,'Monitor::lock_without_safepoint_check()')
+f(15,2306,3,4,'Monitor::ILock(Thread*)')
+f(16,2306,3,4,'os::PlatformEvent::park()')
+f(17,2306,3,3,'__psynch_cvwait')
+f(12,2309,31,3,'gettimeofday')
+f(12,2340,2474,1,'java/util/concurrent/CompletableFuture.thenRun')
+f(13,2370,2444,1,'java/util/concurrent/CompletableFuture.uniRunStage')
+f(14,2370,2,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(15,2370,2,4,'InstanceKlass::allocate_instance(Thread*)')
+f(16,2370,2,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(17,2370,2,4,'MemAllocator::allocate() const')
+f(18,2370,1,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(19,2370,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(20,2370,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(21,2370,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(22,2370,1,4,'Monitor::lock(Thread*)')
+f(23,2370,1,4,'Monitor::ILock(Thread*)')
+f(24,2370,1,4,'os::PlatformEvent::park()')
+f(25,2370,1,3,'__psynch_cvwait')
+f(18,2371,1,4,'ObjAllocator::initialize(HeapWord*) const')
+f(14,2372,2442,1,'java/util/concurrent/CompletableFuture.uniRunNow')
+f(15,2372,1914,1,'java/util/concurrent/CompletableFuture.newIncompleteFuture')
+f(16,3114,7,4,'Set::asCoSet() const (.cold.1)')
+f(16,3121,19,3,'gettimeofday')
+f(16,3140,1146,4,'os::javaTimeMillis()')
+f(17,3309,10,3,'__commpage_gettimeofday')
+f(17,3319,17,3,'__commpage_gettimeofday_internal')
+f(17,3336,13,3,'advance_directory.cold.1')
+f(17,3349,937,3,'gettimeofday')
+f(18,3460,799,3,'__commpage_gettimeofday_internal')
+f(19,3679,580,3,'mach_absolute_time')
+f(18,4259,27,3,'mach_absolute_time')
+f(15,4286,528,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$ResumeWrapper.run')
+f(16,4532,282,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$ThroughputPeriodTimer.markEnd')
+f(17,4532,282,1,'org/apache/flink/runtime/metrics/TimerGauge.markEnd')
+f(12,4814,3557,1,'org/apache/flink/streaming/runtime/io/StreamOneInputProcessor.processInput')
+f(13,4815,3556,1,'org/apache/flink/streaming/runtime/io/StreamTaskSourceInput.emitNext')
+f(14,4815,3556,1,'org/apache/flink/streaming/api/operators/SourceOperator.emitNext')
+f(15,4815,3556,1,'org/apache/flink/connector/base/source/hybrid/HybridSourceReader.pollNext')
+f(16,4824,3543,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.pollNext')
+f(17,4824,875,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.finishedOrAvailableLater')
+f(18,4892,1,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(19,4892,1,4,'SafepointSynchronize::block(JavaThread*)')
+f(20,4892,1,4,'Monitor::lock_without_safepoint_check()')
+f(21,4892,1,4,'Monitor::ILock(Thread*)')
+f(22,4892,1,4,'os::PlatformEvent::park()')
+f(23,4892,1,3,'__psynch_cvwait')
+f(18,4893,4,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.release')
+f(18,4897,802,1,'org/apache/flink/connector/base/source/reader/fetcher/SplitFetcherManager.maybeShutdownFinishedFetchers')
+f(19,5160,8,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(20,5160,6,4,'InstanceKlass::allocate_instance(Thread*)')
+f(21,5160,6,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(22,5160,6,4,'MemAllocator::allocate() const')
+f(23,5160,6,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(24,5160,6,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(25,5160,2,4,'G1Allocator::unsafe_max_tlab_alloc()')
+f(25,5162,4,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(26,5162,4,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(27,5162,1,4,'G1AllocRegion::new_alloc_region_and_allocate(unsigned long, bool)')
+f(28,5162,1,4,'G1CollectedHeap::new_mutator_alloc_region(unsigned long, bool)')
+f(29,5162,1,4,'G1RemSetTrackingPolicy::update_at_allocate(HeapRegion*)')
+f(30,5162,1,4,'G1RemSet::num_par_rem_sets()')
+f(27,5163,1,4,'G1CollectedHeap::do_collection_pause(unsigned long, unsigned int, bool*, GCCause::Cause)')
+f(28,5163,1,4,'VMThread::execute(VM_Operation*)')
+f(29,5163,1,4,'Monitor::wait(bool, long, bool)')
+f(30,5163,1,4,'Monitor::IWait(Thread*, long)')
+f(31,5163,1,4,'os::PlatformEvent::park()')
+f(32,5163,1,3,'__psynch_cvwait')
+f(27,5164,2,4,'MutatorAllocRegion::retire(bool)')
+f(28,5164,1,4,'G1AllocRegion::retire_internal(HeapRegion*, bool)')
+f(29,5164,1,4,'G1CollectedHeap::retire_mutator_alloc_region(HeapRegion*, unsigned long)')
+f(30,5164,1,4,'G1CollectionSet::add_young_region_common(HeapRegion*)')
+f(31,5164,1,4,'OtherRegionsTable::occupied() const')
+f(28,5165,1,4,'G1CollectedHeap::retire_mutator_alloc_region(HeapRegion*, unsigned long)')
+f(20,5166,1,4,'InstanceKlass::klass_holder() const')
+f(20,5167,1,4,'ThreadInVMfromJava::~ThreadInVMfromJava()')
+f(19,5168,117,1,'java/util/concurrent/ConcurrentHashMap$EntryIterator.next')
+f(20,5168,117,1,'java/util/concurrent/ConcurrentHashMap$EntryIterator.next')
+f(21,5168,117,1,'java/util/concurrent/ConcurrentHashMap$Traverser.advance')
+f(19,5285,269,1,'java/util/concurrent/ConcurrentHashMap$EntrySetView.iterator')
+f(20,5285,269,1,'java/util/concurrent/ConcurrentHashMap$EntryIterator.<init>')
+f(21,5285,269,1,'java/util/concurrent/ConcurrentHashMap$BaseIterator.<init>')
+f(22,5285,269,1,'java/util/concurrent/ConcurrentHashMap$Traverser.advance')
+f(19,5554,145,1,'java/util/concurrent/ConcurrentHashMap.isEmpty')
+f(20,5554,145,1,'java/util/concurrent/ConcurrentHashMap.sumCount')
+f(21,5698,1,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(22,5698,1,4,'SafepointSynchronize::block(JavaThread*)')
+f(23,5698,1,4,'Monitor::lock_without_safepoint_check()')
+f(24,5698,1,4,'Monitor::ILock(Thread*)')
+f(25,5698,1,4,'os::PlatformEvent::park()')
+f(26,5698,1,3,'__psynch_cvwait')
+f(17,5699,2269,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.getNextFetch')
+f(18,5699,978,1,'org/apache/flink/connector/base/source/reader/synchronization/FutureCompletingBlockingQueue.poll')
+f(19,5699,72,1,'java/util/ArrayDeque.size')
+f(20,5737,2,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(21,5737,2,4,'SafepointSynchronize::block(JavaThread*)')
+f(22,5737,1,4,'Monitor::lock_without_safepoint_check()')
+f(23,5737,1,4,'Monitor::ILock(Thread*)')
+f(24,5737,1,4,'os::PlatformEvent::park()')
+f(25,5737,1,3,'__psynch_cvwait')
+f(22,5738,1,3,'pthread_cond_signal')
+f(23,5738,1,3,'_pthread_cond_updateval')
+f(20,5739,32,1,'java/util/ArrayDeque.sub')
+f(19,5771,465,1,'java/util/concurrent/locks/ReentrantLock.lock')
+f(20,5824,1,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(21,5824,1,4,'SafepointSynchronize::block(JavaThread*)')
+f(22,5824,1,4,'Monitor::lock_without_safepoint_check()')
+f(23,5824,1,4,'Monitor::ILock(Thread*)')
+f(24,5824,1,4,'os::PlatformEvent::park()')
+f(25,5824,1,3,'__psynch_cvwait')
+f(20,5825,403,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.acquire')
+f(21,6184,44,1,'java/util/concurrent/locks/ReentrantLock$NonfairSync.tryAcquire')
+f(22,6184,44,1,'java/util/concurrent/locks/ReentrantLock$Sync.nonfairTryAcquire')
+f(23,6220,8,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.compareAndSetState')
+f(24,6220,8,1,'java/lang/invoke/VarHandleGuards.guard_LII_Z')
+f(25,6220,8,1,'java/lang/invoke/VarHandleInts$FieldInstanceReadWrite.compareAndSet')
+f(20,6228,8,1,'org/apache/logging/log4j/core/Logger.isEnabled')
+f(19,6236,441,1,'java/util/concurrent/locks/ReentrantLock.unlock')
+f(20,6285,1,3,'SafepointBlob')
+f(20,6286,391,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.release')
+f(21,6343,3,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(22,6343,3,4,'SafepointSynchronize::block(JavaThread*)')
+f(23,6343,3,4,'Monitor::lock_without_safepoint_check()')
+f(24,6343,3,4,'Monitor::ILock(Thread*)')
+f(25,6343,3,4,'os::PlatformEvent::park()')
+f(26,6343,3,3,'__psynch_cvwait')
+f(21,6346,328,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.unparkSuccessor')
+f(22,6660,14,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$Node.compareAndSetWaitStatus')
+f(23,6660,14,1,'java/lang/invoke/VarHandleGuards.guard_LII_Z')
+f(24,6660,14,1,'java/lang/invoke/VarHandleInts$FieldInstanceReadWrite.compareAndSet')
+f(21,6674,3,1,'java/util/concurrent/locks/ReentrantLock$Sync.tryRelease')
+f(18,6677,1291,1,'org/apache/logging/slf4j/Log4jLogger.trace')
+f(19,6677,1291,1,'org/apache/logging/log4j/spi/AbstractLogger.logIfEnabled')
+f(20,7804,14,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(21,7804,13,4,'SafepointSynchronize::block(JavaThread*)')
+f(22,7804,13,4,'Monitor::lock_without_safepoint_check()')
+f(23,7804,13,4,'Monitor::ILock(Thread*)')
+f(24,7804,13,4,'os::PlatformEvent::park()')
+f(25,7804,13,3,'__psynch_cvwait')
+f(21,7817,1,4,'frame::sender(RegisterMap*) const')
+f(22,7817,1,4,'frame::sender_for_compiled_frame(RegisterMap*) const')
+f(23,7817,1,4,'OopMapSet::update_register_map(frame const*, RegisterMap*)')
+f(20,7818,150,1,'org/apache/logging/log4j/core/Logger.isEnabled')
+f(21,7862,106,1,'org/apache/logging/log4j/core/Logger$PrivateConfig.filter')
+f(17,7968,392,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.trace')
+f(18,7968,392,1,'org/apache/logging/slf4j/Log4jLogger.trace')
+f(19,7968,392,1,'org/apache/logging/log4j/spi/AbstractLogger.logIfEnabled')
+f(20,8123,1,3,'SafepointBlob')
+f(20,8124,4,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(21,8124,4,4,'SafepointSynchronize::block(JavaThread*)')
+f(22,8124,4,4,'Monitor::lock_without_safepoint_check()')
+f(23,8124,4,4,'Monitor::ILock(Thread*)')
+f(24,8124,4,4,'os::PlatformEvent::park()')
+f(25,8124,4,3,'__psynch_cvwait')
+f(20,8128,13,1,'org/apache/flink/connector/base/source/reader/fetcher/SplitFetcherManager.maybeShutdownFinishedFetchers')
+f(20,8141,219,1,'org/apache/logging/log4j/core/Logger.isEnabled')
+f(21,8188,172,1,'org/apache/logging/log4j/core/Logger$PrivateConfig.filter')
+f(17,8360,7,1,'org/apache/flink/connector/file/src/impl/FileRecords.nextRecordFromSplit')
+f(16,8367,4,1,'org/apache/flink/connector/base/source/reader/fetcher/SplitFetcherManager.maybeShutdownFinishedFetchers')
+f(12,8371,258,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$ResumeWrapper.<init>')
+f(13,8371,258,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$ThroughputPeriodTimer.markStart')
+f(14,8371,258,1,'org/apache/flink/runtime/metrics/TimerGauge.markStart')
+f(12,8629,5,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor$MailboxController.suspendDefaultAction')
+f(13,8629,5,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.access$100')
+f(14,8629,5,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.suspendDefaultAction')
+f(15,8630,1,4,'AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<1097844ull, G1BarrierSet>, (AccessInternal::BarrierType)2, 1097844ull>::oop_access_barrier(void*)')
+f(15,8631,3,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(16,8632,1,4,'InstanceKlass::allocate_instance(Thread*)')
+f(17,8632,1,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(18,8632,1,4,'MemAllocator::allocate() const')
+f(19,8632,1,4,'ObjAllocator::initialize(HeapWord*) const')
+f(20,8632,1,3,'_platform_bzero$VARIANT$Haswell')
+f(16,8633,1,4,'SharedRuntime::on_slowpath_allocation_exit(JavaThread*)')
+f(12,8634,37,1,'org/apache/flink/util/concurrent/FutureUtils.assertNoException')
+f(13,8634,37,1,'org/apache/flink/util/concurrent/FutureUtils.handleUncaughtException')
+f(14,8634,8,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(15,8634,8,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(16,8634,8,1,'org/apache/flink/util/concurrent/FutureUtils$$Lambda$759/651638041.get$Lambda')
+f(17,8634,1,4,'InstanceKlass::klass_holder() const')
+f(17,8635,6,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(18,8635,4,4,'InstanceKlass::allocate_instance(Thread*)')
+f(19,8636,3,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(20,8636,3,4,'MemAllocator::allocate() const')
+f(21,8636,1,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(22,8636,1,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(23,8636,1,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(24,8636,1,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(25,8636,1,4,'Monitor::lock(Thread*)')
+f(26,8636,1,4,'Monitor::ILock(Thread*)')
+f(27,8636,1,4,'os::PlatformEvent::park()')
+f(28,8636,1,3,'__psynch_cvwait')
+f(21,8637,2,4,'ObjAllocator::initialize(HeapWord*) const')
+f(22,8638,1,3,'_platform_bzero$VARIANT$Haswell')
+f(18,8639,1,4,'ThreadInVMfromJava::~ThreadInVMfromJava()')
+f(19,8639,1,4,'os::is_MP()')
+f(18,8640,1,4,'oopDesc* RawAccessBarrier<1097844ull>::oop_load<oopDesc*>(void*)')
+f(17,8641,1,4,'ThreadInVMfromJava::~ThreadInVMfromJava()')
+f(14,8642,29,1,'java/util/concurrent/CompletableFuture.whenComplete')
+f(15,8642,29,1,'java/util/concurrent/CompletableFuture.uniWhenCompleteStage')
+f(16,8642,2,1,'java/util/concurrent/CompletableFuture.newIncompleteFuture')
+f(17,8642,2,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(18,8643,1,4,'Arena::Amalloc_4(unsigned long, AllocFailStrategy::AllocFailEnum)')
+f(19,8643,1,4,'Arena::check_for_overflow(unsigned long, char const*, AllocFailStrategy::AllocFailEnum) const')
+f(16,8644,27,1,'java/util/concurrent/CompletableFuture.unipush')
+f(17,8669,1,4,'ThreadSafepointState::handle_polling_page_exception()')
+f(18,8669,1,4,'SafepointSynchronize::block(JavaThread*)')
+f(19,8669,1,4,'Monitor::lock_without_safepoint_check()')
+f(20,8669,1,4,'Monitor::ILock(Thread*)')
+f(21,8669,1,4,'os::PlatformEvent::park()')
+f(22,8669,1,3,'__psynch_cvwait')
+f(17,8670,1,1,'java/util/concurrent/CompletableFuture.thenRun')
+f(12,8671,10,1,'org/apache/logging/log4j/core/Logger.isEnabled')
+f(12,8681,1215,4,'os::javaTimeMillis()')
+f(13,8854,19,3,'__commpage_gettimeofday')
+f(13,8873,21,3,'__commpage_gettimeofday_internal')
+f(13,8894,8,3,'advance_directory.cold.1')
+f(13,8902,994,3,'gettimeofday')
+f(14,9021,868,3,'__commpage_gettimeofday_internal')
+f(15,9235,654,3,'mach_absolute_time')
+f(14,9889,7,3,'mach_absolute_time')
+f(10,9896,3,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.isNextLoopPossible')
+f(10,9899,17,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.processMail')
+f(11,9901,3,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.processMailsNonBlocking')
+f(12,9901,1,1,'org/apache/flink/streaming/runtime/tasks/mailbox/Mail.run')
+f(13,9901,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTaskActionExecutor$1.runThrowing')
+f(14,9901,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$$Lambda$1544/58944163.run')
+f(15,9901,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.lambda$null$22')
+f(16,9901,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask.invokeProcessingTimeCallback')
+f(17,9901,1,1,'org/apache/flink/streaming/api/operators/source/ProgressiveTimestampsAndWatermarks$$Lambda$1424/794587127.onProcessingTime')
+f(18,9901,1,1,'org/apache/flink/streaming/api/operators/source/ProgressiveTimestampsAndWatermarks.triggerPeriodicEmit')
+f(19,9901,1,1,'org/apache/flink/streaming/api/operators/source/ProgressiveTimestampsAndWatermarks$SplitLocalOutputs.emitPeriodicWatermark')
+f(20,9901,1,1,'org/apache/flink/api/common/eventtime/WatermarkOutputMultiplexer.onPeriodicEmit')
+f(21,9901,1,1,'org/apache/flink/api/common/eventtime/WatermarkOutputMultiplexer.updateCombinedWatermark')
+f(12,9902,1,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.maybePauseIdleTimer')
+f(13,9902,1,1,'org/apache/flink/streaming/runtime/tasks/StreamTask$ThroughputPeriodTimer.markEnd')
+f(12,9903,1,1,'org/apache/flink/streaming/runtime/tasks/mailbox/TaskMailboxImpl.tryTakeFromBatch')
+f(13,9903,1,1,'org/apache/flink/streaming/runtime/tasks/mailbox/TaskMailboxImpl.checkTakeStateConditions')
+f(11,9904,7,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.processMailsWhenDefaultActionUnavailable')
+f(12,9906,5,4,'OptoRuntime::new_instance_C(Klass*, JavaThread*)')
+f(13,9906,4,4,'InstanceKlass::allocate_instance(Thread*)')
+f(14,9906,4,4,'CollectedHeap::obj_allocate(Klass*, int, Thread*)')
+f(15,9906,4,4,'MemAllocator::allocate() const')
+f(16,9906,1,4,'MemAllocator::Allocation::notify_allocation()')
+f(17,9906,1,4,'AllocTracer::send_allocation_in_new_tlab(Klass*, HeapWord*, unsigned long, unsigned long, Thread*)')
+f(16,9907,3,4,'MemAllocator::mem_allocate(MemAllocator::Allocation&) const')
+f(17,9907,3,4,'MemAllocator::allocate_inside_tlab_slow(MemAllocator::Allocation&) const')
+f(18,9907,3,4,'G1CollectedHeap::allocate_new_tlab(unsigned long, unsigned long, unsigned long*)')
+f(19,9907,3,4,'G1CollectedHeap::attempt_allocation_slow(unsigned long)')
+f(20,9908,2,4,'G1AllocRegion::new_alloc_region_and_allocate(unsigned long, bool)')
+f(21,9908,2,4,'G1CollectedHeap::new_mutator_alloc_region(unsigned long, bool)')
+f(22,9908,1,4,'G1CollectedHeap::new_region(unsigned long, bool, bool)')
+f(22,9909,1,4,'HeapRegion::set_eden()')
+f(23,9909,1,4,'HeapRegion::report_region_type_change(G1HeapRegionTraceType::Type)')
+f(24,9909,1,4,'G1ContiguousSpace::used() const')
+f(13,9910,1,4,'SharedRuntime::on_slowpath_allocation_exit(JavaThread*)')
+f(11,9911,5,1,'org/apache/flink/streaming/runtime/tasks/mailbox/TaskMailboxImpl.createBatch')
+f(12,9914,1,1,'java/util/ArrayDeque.addLast')
+f(12,9915,1,1,'java/util/ArrayDeque.isEmpty')
+f(1,9916,1,1,'org/apache/flink/streaming/runtime/tasks/mailbox/MailboxProcessor.runMailboxLoop')
+f(2,9916,1,1,'org/apache/flink/streaming/runtime/io/StreamOneInputProcessor.processInput')
+f(3,9916,1,1,'org/apache/flink/streaming/runtime/io/StreamTaskSourceInput.emitNext')
+f(4,9916,1,1,'org/apache/flink/streaming/api/operators/SourceOperator.emitNext')
+f(5,9916,1,1,'org/apache/flink/connector/base/source/hybrid/HybridSourceReader.pollNext')
+f(6,9916,1,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.pollNext')
+f(7,9916,1,1,'org/apache/flink/connector/base/source/reader/SourceReaderBase.getNextFetch')
+f(8,9916,1,1,'org/apache/flink/connector/base/source/reader/synchronization/FutureCompletingBlockingQueue.poll')
+f(9,9916,1,1,'java/util/concurrent/locks/ReentrantLock.unlock')
+f(10,9916,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.release')
+f(11,9916,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer.unparkSuccessor')
+f(12,9916,1,1,'java/util/concurrent/locks/AbstractQueuedSynchronizer$Node.compareAndSetWaitStatus')
+f(13,9916,1,1,'java/lang/invoke/VarHandleGuards.guard_LII_Z')
+f(14,9916,1,1,'java/lang/invoke/VarHandleInts$FieldInstanceReadWrite.compareAndSet')
+f(1,9917,88,3,'thread_start')
+f(2,9917,88,3,'_pthread_start')
+f(3,9917,88,3,'thread_native_entry(Thread*)')
+f(4,9917,88,4,'Thread::call_run()')
+f(5,9917,5,4,'ConcurrentGCThread::run()')
+f(6,9917,5,4,'G1YoungRemSetSamplingThread::run_service()')
+f(7,9917,4,4,'G1YoungRemSetSamplingThread::sample_young_list_rs_lengths()')
+f(8,9917,4,4,'G1CollectionSet::iterate_from(HeapRegionClosure*, unsigned int, unsigned int) const')
+f(9,9918,3,4,'G1YoungRemSetSamplingClosure::do_heap_region(HeapRegion*)')
+f(10,9918,2,4,'G1CollectionSet::update_young_region_prediction(HeapRegion*, unsigned long)')
+f(11,9918,2,4,'G1Policy::predict_region_elapsed_time_ms(HeapRegion*, bool) const')
+f(12,9918,1,4,'G1Analytics::predict_rs_scan_time_ms(unsigned long, bool) const')
+f(12,9919,1,4,'G1Analytics::predict_young_other_time_ms(unsigned long) const')
+f(13,9919,1,4,'G1Predictions::stddev_estimate(TruncatedSeq const*) const')
+f(14,9919,1,4,'AbsSeq::dvariance() const')
+f(10,9920,1,4,'OtherRegionsTable::occupied() const')
+f(7,9921,1,4,'G1YoungRemSetSamplingThread::sleep_before_next_cycle()')
+f(8,9921,1,4,'Monitor::wait(bool, long, bool)')
+f(9,9921,1,4,'Monitor::IWait(Thread*, long)')
+f(10,9921,1,4,'os::PlatformEvent::park(long)')
+f(11,9921,1,3,'__psynch_cvwait')
+f(5,9922,39,4,'GangWorker::loop()')
+f(6,9923,5,4,'G1FreeCollectionSetTask::work(unsigned int)')
+f(7,9923,1,4,'G1FreeCollectionSetTask::do_parallel_work_for_region(unsigned int, bool, bool)')
+f(8,9923,1,4,'OtherRegionsTable::occupied() const')
+f(9,9923,1,4,'OtherRegionsTable::occ_fine() const')
+f(7,9924,4,4,'G1FreeCollectionSetTask::do_serial_work()')
+f(8,9924,4,4,'G1CollectionSet::iterate_from(HeapRegionClosure*, unsigned int, unsigned int) const')
+f(9,9924,4,4,'G1FreeCollectionSetTask::G1SerialFreeCollectionSetClosure::do_heap_region(HeapRegion*)')
+f(10,9925,1,4,'G1CollectedHeap::free_region(HeapRegion*, FreeRegionList*, bool, bool, bool)')
+f(10,9926,1,4,'G1ContiguousSpace::clear(bool)')
+f(10,9927,1,4,'G1ContiguousSpace::used() const')
+f(6,9928,1,4,'G1RemSetScanState::G1ClearCardTableTask::work(unsigned int)')
+f(6,9929,11,4,'ParallelSPCleanupTask::work(unsigned int)')
+f(7,9929,11,4,'Threads::possibly_parallel_threads_do(bool, ThreadClosure*)')
+f(8,9929,10,4,'JavaThread::nmethods_do(CodeBlobClosure*)')
+f(9,9929,1,4,'JvmtiThreadState::nmethods_do(CodeBlobClosure*)')
+f(9,9930,1,4,'StackFrameStream::StackFrameStream(JavaThread*, bool)')
+f(10,9930,1,4,'JavaThread::pd_last_frame()')
+f(11,9930,1,4,'CodeHeap::find_blob_unsafe(void*) const')
+f(9,9931,1,4,'frame::entry_frame_is_first() const')
+f(9,9932,7,4,'frame::sender(RegisterMap*) const')
+f(10,9932,1,4,'frame::sender_for_compiled_frame(RegisterMap*) const')
+f(10,9933,6,4,'frame::sender_for_interpreter_frame(RegisterMap*) const')
+f(11,9937,2,4,'CodeCache::find_blob(void*)')
+f(12,9937,2,4,'CodeHeap::find_blob_unsafe(void*) const')
+f(13,9937,2,4,'CodeHeap::find_start(void*) const')
+f(8,9939,1,4,'StackFrameStream::StackFrameStream(JavaThread*, bool)')
+f(6,9940,19,4,'SemaphoreGangTaskDispatcher::worker_wait_for_task()')
+f(7,9940,19,3,'semaphore_wait_trap')
+f(6,9959,2,3,'semaphore_signal_trap')
+f(5,9961,17,4,'JavaThread::run()')
+f(6,9961,17,4,'JavaThread::thread_main_inner()')
+f(7,9961,16,4,'CompileBroker::compiler_thread_loop()')
+f(8,9961,12,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(9,9961,6,4,'C2Compiler::compile_method(ciEnv*, ciMethod*, int, DirectiveSet*)')
+f(10,9961,6,4,'Compile::Compile(ciEnv*, C2Compiler*, ciMethod*, int, bool, bool, bool, DirectiveSet*)')
+f(11,9961,4,4,'Compile::Code_Gen()')
+f(12,9961,4,4,'PhaseChaitin::Register_Allocate()')
+f(13,9961,1,4,'PhaseChaitin::build_ifg_physical(ResourceArea*)')
+f(14,9961,1,4,'PhaseChaitin::compute_initial_block_pressure(Block*, IndexSet*, PhaseChaitin::Pressure&, PhaseChaitin::Pressure&, double)')
+f(15,9961,1,4,'IndexSetIterator::advance_and_next()')
+f(13,9962,1,4,'PhaseChaitin::merge_multidefs()')
+f(13,9963,1,4,'PhaseChaitin::post_allocate_copy_removal()')
+f(14,9963,1,4,'PhaseChaitin::elide_copy(Node*, int, Block*, Node_List&, Node_List&, bool)')
+f(13,9964,1,4,'PhaseLive::compute(unsigned int)')
+f(14,9964,1,4,'PhaseLive::add_liveout(Block*, IndexSet*, VectorSet&)')
+f(15,9964,1,4,'IndexSet::insert(unsigned int)')
+f(11,9965,1,4,'Compile::inline_string_calls(bool)')
+f(12,9965,1,4,'LateInlineCallGenerator::do_late_inline()')
+f(13,9965,1,4,'ParseGenerator::generate(JVMState*)')
+f(14,9965,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(15,9965,1,4,'Parse::do_all_blocks()')
+f(16,9965,1,4,'Parse::do_one_block()')
+f(17,9965,1,4,'Parse::do_call()')
+f(18,9965,1,4,'ParseGenerator::generate(JVMState*)')
+f(19,9965,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(20,9965,1,4,'Parse::do_all_blocks()')
+f(21,9965,1,4,'Parse::do_one_block()')
+f(22,9965,1,4,'Parse::do_if(BoolTest::mask, Node*)')
+f(23,9965,1,4,'Parse::branch_prediction(float&, BoolTest::mask, int, Node*)')
+f(24,9965,1,4,'Parse::dynamic_branch_prediction(float&, BoolTest::mask, Node*)')
+f(25,9965,1,4,'ciMethodData::bci_to_data(int, ciMethod*)')
+f(26,9965,1,4,'resource_allocate_bytes(unsigned long, AllocFailStrategy::AllocFailEnum)')
+f(11,9966,1,4,'ParseGenerator::generate(JVMState*)')
+f(12,9966,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(13,9966,1,4,'Parse::do_all_blocks()')
+f(14,9966,1,4,'Parse::do_one_block()')
+f(15,9966,1,4,'Parse::do_call()')
+f(16,9966,1,4,'ParseGenerator::generate(JVMState*)')
+f(17,9966,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(18,9966,1,4,'Parse::do_all_blocks()')
+f(19,9966,1,4,'Parse::do_one_block()')
+f(20,9966,1,4,'Parse::do_call()')
+f(21,9966,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(22,9966,1,4,'ParseGenerator::generate(JVMState*)')
+f(23,9966,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(24,9966,1,4,'Parse::do_all_blocks()')
+f(9,9967,1,4,'CompilationLog::log_compile(JavaThread*, CompileTask*)')
+f(10,9967,1,4,'CompileTask::print(outputStream*, char const*, bool, bool)')
+f(11,9967,1,4,'CompileTask::print_impl(outputStream*, Method*, int, int, bool, int, bool, char const*, bool, bool, long, long)')
+f(12,9967,1,4,'Method::print_short_name(outputStream*)')
+f(13,9967,1,4,'Symbol::print_symbol_on(outputStream*) const')
+f(14,9967,1,4,'os::strdup(char const*, MemoryType)')
+f(15,9967,1,4,'os::malloc(unsigned long, MemoryType)')
+f(9,9968,5,4,'Compiler::compile_method(ciEnv*, ciMethod*, int, DirectiveSet*)')
+f(10,9968,5,4,'Compilation::Compilation(AbstractCompiler*, ciEnv*, ciMethod*, int, BufferBlob*, DirectiveSet*)')
+f(11,9968,5,4,'Compilation::compile_method()')
+f(12,9968,4,4,'Compilation::compile_java_method()')
+f(13,9968,2,4,'Compilation::build_hir()')
+f(14,9968,2,4,'IR::IR(Compilation*, ciMethod*, int)')
+f(15,9968,2,4,'IRScope::IRScope(Compilation*, IRScope*, int, ciMethod*, int, bool)')
+f(16,9968,2,4,'GraphBuilder::GraphBuilder(Compilation*, IRScope*)')
+f(17,9968,2,4,'GraphBuilder::iterate_all_blocks(bool)')
+f(18,9968,1,4,'GraphBuilder::connect_to_end(BlockBegin*)')
+f(19,9968,1,4,'ValueStack::copy_for_parsing()')
+f(20,9968,1,4,'ValueStack::ValueStack(ValueStack*, ValueStack::Kind, int)')
+f(21,9968,1,4,'Arena::Amalloc(unsigned long, AllocFailStrategy::AllocFailEnum)')
+f(22,9968,1,4,'Arena::check_for_overflow(unsigned long, char const*, AllocFailStrategy::AllocFailEnum) const')
+f(18,9969,1,4,'GraphBuilder::iterate_bytecodes_for_block(int)')
+f(19,9969,1,4,'GraphBuilder::invoke(Bytecodes::Code)')
+f(20,9969,1,4,'GraphBuilder::try_inline(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(21,9969,1,4,'GraphBuilder::try_inline_full(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(22,9969,1,4,'GraphBuilder::iterate_all_blocks(bool)')
+f(23,9969,1,4,'GraphBuilder::iterate_bytecodes_for_block(int)')
+f(24,9969,1,4,'GraphBuilder::invoke(Bytecodes::Code)')
+f(13,9970,2,4,'Compilation::emit_lir()')
+f(14,9970,2,4,'LinearScan::do_linear_scan()')
+f(15,9970,1,4,'LinearScan::build_intervals()')
+f(16,9970,1,4,'LinearScan::add_temp(int, int, IntervalUseKind, BasicType)')
+f(17,9970,1,4,'LinearScan::create_interval(int)')
+f(18,9970,1,4,'Interval::Interval(int)')
+f(19,9970,1,4,'GrowableArray<int>::GrowableArray(int, bool, MemoryType)')
+f(15,9971,1,4,'LinearScan::init_compute_debug_info()')
+f(12,9972,1,4,'Compilation::install_code(int)')
+f(13,9972,1,4,'ciEnv::register_method(ciMethod*, int, CodeOffsets*, int, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, bool, bool, RTMState)')
+f(14,9972,1,4,'nmethod::new_nmethod(methodHandle const&, int, int, CodeOffsets*, int, DebugInformationRecorder*, Dependencies*, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, int, char*, int, int, char const*, FailedSpeculation**)')
+f(15,9972,1,4,'nmethod::nmethod(Method*, CompilerType, int, int, int, CodeOffsets*, int, DebugInformationRecorder*, Dependencies*, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, int, char*, int, int)')
+f(16,9972,1,4,'CodeCache::get_code_heap(CodeBlob const*)')
+f(8,9973,4,4,'CompileQueue::get()')
+f(9,9973,3,4,'Monitor::wait(bool, long, bool)')
+f(10,9973,3,4,'Monitor::IWait(Thread*, long)')
+f(11,9973,3,4,'os::PlatformEvent::park(long)')
+f(12,9973,3,3,'__psynch_cvwait')
+f(9,9976,1,3,'__psynch_cvsignal')
+f(7,9977,1,3,'attach_listener_thread_entry(JavaThread*, Thread*)')
+f(8,9977,1,3,'close')
+f(5,9978,11,4,'VMThread::run()')
+f(6,9978,11,4,'VMThread::loop()')
+f(7,9978,1,4,'Monitor::wait(bool, long, bool)')
+f(8,9978,1,4,'Monitor::IWait(Thread*, long)')
+f(9,9978,1,4,'os::PlatformEvent::park(long)')
+f(10,9978,1,3,'__psynch_cvwait')
+f(7,9979,9,4,'SafepointSynchronize::begin()')
+f(8,9981,4,4,'Monitor::wait(bool, long, bool)')
+f(9,9981,4,4,'Monitor::IWait(Thread*, long)')
+f(10,9981,1,3,'__psynch_cvsignal')
+f(10,9982,3,4,'os::PlatformEvent::park()')
+f(11,9982,3,3,'__psynch_cvwait')
+f(8,9985,1,4,'RuntimeService::record_safepoint_synchronized()')
+f(9,9985,1,4,'TimeStamp::ticks_since_update() const')
+f(10,9985,1,4,'os::elapsed_counter()')
+f(11,9985,1,4,'os::javaTimeNanos()')
+f(12,9985,1,3,'mach_absolute_time')
+f(8,9986,1,4,'SafepointSynchronize::do_cleanup_tasks()')
+f(9,9986,1,4,'WorkGang::run_task(AbstractGangTask*, unsigned int)')
+f(10,9986,1,4,'SemaphoreGangTaskDispatcher::coordinator_execute_on_workers(AbstractGangTask*, unsigned int)')
+f(11,9986,1,3,'semaphore_signal_trap')
+f(8,9987,1,4,'ThreadSafepointState::examine_state_of_thread()')
+f(7,9988,1,4,'VMThread::evaluate_operation(VM_Operation*)')
+f(8,9988,1,4,'VM_Operation::evaluate()')
+f(9,9988,1,4,'VM_G1CollectForAllocation::doit()')
+f(10,9988,1,4,'G1CollectedHeap::do_collection_pause_at_safepoint(double)')
+f(11,9988,1,4,'G1GCPhaseTimes::reset()')
+f(12,9988,1,4,'WorkerDataArray<double>::reset()')
+f(5,9989,16,4,'WatcherThread::run()')
+f(6,9989,16,4,'WatcherThread::sleep() const')
+f(7,9989,16,4,'Monitor::wait(bool, long, bool)')
+f(8,9989,16,4,'Monitor::IWait(Thread*, long)')
+f(9,9989,16,4,'os::PlatformEvent::park(long)')
+f(10,9989,16,3,'__psynch_cvwait')
+render();
+</script></body></html>
